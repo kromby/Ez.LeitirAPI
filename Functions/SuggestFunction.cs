@@ -36,34 +36,36 @@ public class SuggestFunction
             if (string.IsNullOrEmpty(q) || string.IsNullOrEmpty(scope))
             {
                 var errorResponse = req.CreateResponse(HttpStatusCode.BadRequest);
-                await errorResponse.WriteAsJsonAsync(new { error = new { message = "missing q or scope" } });
+                await errorResponse.WriteAsJsonAsync(new { error = new { message = "missing q or scope" } }).ConfigureAwait(false);
                 return errorResponse;
             }
 
             // Call the client
-            var raw = await _client.SuggestAsync(q, scope);
+            var raw = await _client.SuggestAsync(q, scope).ConfigureAwait(false);
 
             // Shape the response
             var shaped = LeitirShaper.ShapeSuggest(raw);
 
             // Return success
             var response = req.CreateResponse(HttpStatusCode.OK);
-            await response.WriteAsJsonAsync(shaped);
+            await response.WriteAsJsonAsync(shaped).ConfigureAwait(false);
             return response;
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogError(ex, "HTTP request exception in SuggestFunction");
-            var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
-            await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } });
-            return errorResponse;
+            return await HandleErrorResponse(req, ex, "suggest").ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected exception in SuggestFunction");
-            var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
-            await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } });
-            return errorResponse;
+            return await HandleErrorResponse(req, ex, "suggest").ConfigureAwait(false);
         }
+    }
+
+    private async Task<HttpResponseData> HandleErrorResponse(HttpRequestData req, Exception ex, string context)
+    {
+        _logger.LogError(ex, "Exception in SuggestFunction ({Context})", context);
+        var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
+        await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } }).ConfigureAwait(false);
+        return errorResponse;
     }
 }

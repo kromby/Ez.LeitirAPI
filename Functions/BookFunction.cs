@@ -36,7 +36,7 @@ public class BookFunction
             if (string.IsNullOrEmpty(trimmedMmsId))
             {
                 var errorResponse = req.CreateResponse(HttpStatusCode.BadRequest);
-                await errorResponse.WriteAsJsonAsync(new { error = new { message = "missing mmsId" } });
+                await errorResponse.WriteAsJsonAsync(new { error = new { message = "missing mmsId" } }).ConfigureAwait(false);
                 return errorResponse;
             }
 
@@ -47,35 +47,37 @@ public class BookFunction
             }
 
             // Parallel calls to both endpoints
-            var pnxTask = _client.GetFullRecordAsync(trimmedMmsId);
-            var physicalTask = _client.GetPhysicalServiceAsync(trimmedMmsId);
+            var results = await Task.WhenAll(
+                _client.GetFullRecordAsync(trimmedMmsId),
+                _client.GetPhysicalServiceAsync(trimmedMmsId)
+            ).ConfigureAwait(false);
 
-            await Task.WhenAll(pnxTask, physicalTask);
-
-            var pnxDoc = pnxTask.Result;
-            var physical = physicalTask.Result;
+            var pnxDoc = results[0];
+            var physical = results[1];
 
             // Shape the response
             var shaped = LeitirShaper.ShapeBook(pnxDoc, physical);
 
             // Return success
             var response = req.CreateResponse(HttpStatusCode.OK);
-            await response.WriteAsJsonAsync(shaped);
+            await response.WriteAsJsonAsync(shaped).ConfigureAwait(false);
             return response;
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogError(ex, "HTTP request exception in BookFunction");
-            var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
-            await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } });
-            return errorResponse;
+            return await HandleErrorResponse(req, ex, "book").ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected exception in BookFunction");
-            var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
-            await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } });
-            return errorResponse;
+            return await HandleErrorResponse(req, ex, "book").ConfigureAwait(false);
         }
+    }
+
+    private async Task<HttpResponseData> HandleErrorResponse(HttpRequestData req, Exception ex, string context)
+    {
+        _logger.LogError(ex, "Exception in BookFunction ({Context})", context);
+        var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
+        await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } }).ConfigureAwait(false);
+        return errorResponse;
     }
 }

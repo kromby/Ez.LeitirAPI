@@ -45,12 +45,12 @@ public class SearchFunction
             if (string.IsNullOrEmpty(q) || string.IsNullOrEmpty(scope))
             {
                 var errorResponse = req.CreateResponse(HttpStatusCode.BadRequest);
-                await errorResponse.WriteAsJsonAsync(new { error = new { message = "missing q or scope" } });
+                await errorResponse.WriteAsJsonAsync(new { error = new { message = "missing q or scope" } }).ConfigureAwait(false);
                 return errorResponse;
             }
 
             // Call the client
-            var pnxs = await _client.SearchAsync(q, scope, offset);
+            var pnxs = await _client.SearchAsync(q, scope, offset).ConfigureAwait(false);
 
             // Create empty delivery
             var emptyDelivery = JsonDocument.Parse("{\"docs\":[]}").RootElement;
@@ -60,22 +60,24 @@ public class SearchFunction
 
             // Return success
             var response = req.CreateResponse(HttpStatusCode.OK);
-            await response.WriteAsJsonAsync(shaped);
+            await response.WriteAsJsonAsync(shaped).ConfigureAwait(false);
             return response;
         }
         catch (HttpRequestException ex)
         {
-            _logger.LogError(ex, "HTTP request exception in SearchFunction");
-            var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
-            await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } });
-            return errorResponse;
+            return await HandleErrorResponse(req, ex, "search").ConfigureAwait(false);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Unexpected exception in SearchFunction");
-            var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
-            await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } });
-            return errorResponse;
+            return await HandleErrorResponse(req, ex, "search").ConfigureAwait(false);
         }
+    }
+
+    private async Task<HttpResponseData> HandleErrorResponse(HttpRequestData req, Exception ex, string context)
+    {
+        _logger.LogError(ex, "Exception in SearchFunction ({Context})", context);
+        var errorResponse = req.CreateResponse(HttpStatusCode.BadGateway);
+        await errorResponse.WriteAsJsonAsync(new { error = new { message = "upstream failure" } }).ConfigureAwait(false);
+        return errorResponse;
     }
 }
