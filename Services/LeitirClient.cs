@@ -97,8 +97,8 @@ public class LeitirClient
     /// </summary>
     public async Task<JsonElement> GetFullRecordAsync(string mmsId, CancellationToken cancellationToken = default)
     {
-        var url = $"{_baseUrl}/primaws/rest/priv/nz/pnx/P/{Uri.EscapeDataString(mmsId)}?record-institution=&lang=is";
-        
+        var url = $"{_baseUrl}/primaws/rest/priv/nz/pnx/P/{Uri.EscapeDataString(mmsId)}?record-institution={Uri.EscapeDataString(_inst)}&lang=is";
+
         return await AuthedJsonAsync(url, "GET", cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
