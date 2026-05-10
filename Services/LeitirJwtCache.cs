@@ -9,7 +9,7 @@ namespace Ez.Leitir.Services;
 /// Maintains a cached token, tracks expiry, and refreshes 30 minutes before expiry.
 /// Handles in-flight deduplication to avoid multiple simultaneous fetch requests.
 /// </summary>
-public class LeitirJwtCache
+public class LeitirJwtCache : IDisposable
 {
     private const long RefreshThresholdMs = 30 * 60 * 1000; // 30 minutes in milliseconds
     private const int FetchTimeoutSeconds = 10;
@@ -32,7 +32,7 @@ public class LeitirJwtCache
     /// Gets a valid JWT token, refreshing if necessary.
     /// If multiple callers request simultaneously, they share the same in-flight request.
     /// </summary>
-    public async Task<string> GetJwtAsync()
+    public async Task<string> GetJwtAsync(CancellationToken cancellationToken = default)
     {
         var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -45,11 +45,11 @@ public class LeitirJwtCache
         // If a fetch is already in flight, return the same promise
         if (_inFlight != null)
         {
-            return await _inFlight;
+            return await _inFlight.ConfigureAwait(false);
         }
 
         // Acquire the semaphore to prevent multiple simultaneous fetches
-        await _semaphore.WaitAsync();
+        await _semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             // Double-check pattern: verify token is still stale after acquiring lock
@@ -60,8 +60,8 @@ public class LeitirJwtCache
             }
 
             // Set the in-flight task and return it
-            _inFlight = FetchFreshAsync("expiry");
-            var token = await _inFlight;
+            _inFlight = FetchFreshAsync("expiry", cancellationToken);
+            var token = await _inFlight.ConfigureAwait(false);
             _inFlight = null;
             return token;
         }
@@ -74,7 +74,7 @@ public class LeitirJwtCache
     /// <summary>
     /// Fetches a fresh JWT from leitir.is.
     /// </summary>
-    private async Task<string> FetchFreshAsync(string reason = "expiry")
+    private async Task<string> FetchFreshAsync(string reason = "expiry", CancellationToken cancellationToken = default)
     {
         var baseUrl = Environment.GetEnvironmentVariable("LEITIR_BASE_URL")
                       ?? throw new InvalidOperationException("LEITIR_BASE_URL environment variable is not set");
@@ -85,12 +85,13 @@ public class LeitirJwtCache
 
         var url = $"{baseUrl}/primaws/rest/pub/institution/{inst}/guestJwt?isGuest=true&lang=is&viewId={vid}";
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(FetchTimeoutSeconds));
-        var response = await _httpClient.GetAsync(url, cts.Token);
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(FetchTimeoutSeconds));
+        var response = await _httpClient.GetAsync(url, cts.Token).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
 
         // Read response as text and clean it
-        var responseText = await response.Content.ReadAsStringAsync(cts.Token);
+        var responseText = await response.Content.ReadAsStringAsync(cts.Token).ConfigureAwait(false);
         responseText = responseText.Trim();
 
         // Remove quotes if present
@@ -154,4 +155,6 @@ public class LeitirJwtCache
 
         return Convert.FromBase64String(base64);
     }
+
+    public void Dispose() => _semaphore?.Dispose();
 }
