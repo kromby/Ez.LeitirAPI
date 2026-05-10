@@ -1,0 +1,31 @@
+@baseUrl = http://localhost:7071
+@apiKey = test-key-change-me
+
+###
+# Missing API key → 401
+GET {{baseUrl}}/api/suggest?q=lax&scope=10000_MYLIB
+
+###
+# Wrong API key → 401
+GET {{baseUrl}}/api/suggest?q=lax&scope=10000_MYLIB
+X-Api-Key: wrong-key
+
+###
+# Valid suggest request → 200
+GET {{baseUrl}}/api/suggest?q=lax&scope=10000_MYLIB
+X-Api-Key: {{apiKey}}
+
+###
+# Search by keyword → 200 with results
+GET {{baseUrl}}/api/search?q=laxness&scope=10000_MYLIB&offset=0
+X-Api-Key: {{apiKey}}
+
+###
+# Search by ISBN → 200 with correct book
+GET {{baseUrl}}/api/search?q=9789979103844&scope=10000_MYLIB&offset=0
+X-Api-Key: {{apiKey}}
+
+###
+# Book detail → 200 with branches
+GET {{baseUrl}}/api/book/991009684239706886
+X-Api-Key: {{apiKey}}
