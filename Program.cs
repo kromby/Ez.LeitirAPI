@@ -12,6 +12,7 @@ builder.Services
     .AddApplicationInsightsTelemetryWorkerService()
     .ConfigureFunctionsApplicationInsights()
     .AddHttpClient()
-    .AddSingleton<LeitirJwtCache>();
+    .AddSingleton<LeitirJwtCache>()
+    .AddScoped<LeitirClient>();
 
 builder.Build().Run();
