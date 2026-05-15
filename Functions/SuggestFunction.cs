@@ -4,6 +4,7 @@ using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 using Ez.Leitir.Services;
 using Ez.Leitir.Shaping;
+using Ez.Leitir.Middleware;
 
 namespace Ez.Leitir.Functions;
 
@@ -28,6 +29,13 @@ public class SuggestFunction
     {
         try
         {
+            // Validate API key
+            var validationError = await ApiKeyValidator.ValidateApiKey(req, _logger).ConfigureAwait(false);
+            if (validationError != null)
+            {
+                return validationError;
+            }
+
             // Get and trim query parameters
             var q = req.Query["q"]?.ToString().Trim();
             var scope = req.Query["scope"]?.ToString().Trim();

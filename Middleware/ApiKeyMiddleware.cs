@@ -1,49 +1,34 @@
-using Microsoft.AspNetCore.Http;
+using System.Net;
+using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 
 namespace Ez.Leitir.Middleware;
 
-public class ApiKeyMiddleware
+public static class ApiKeyValidator
 {
-    private readonly RequestDelegate _next;
-    private readonly ILogger<ApiKeyMiddleware> _logger;
-
-    public ApiKeyMiddleware(RequestDelegate next, ILogger<ApiKeyMiddleware> logger)
-    {
-        _next = next;
-        _logger = logger;
-    }
-
-    public async Task InvokeAsync(HttpContext context)
+    public static async Task<HttpResponseData?> ValidateApiKey(HttpRequestData req, ILogger logger)
     {
         var apiKey = Environment.GetEnvironmentVariable("LEITIR_API_KEY");
 
         if (string.IsNullOrEmpty(apiKey))
         {
-            _logger.LogError("LEITIR_API_KEY not configured");
-            context.Response.StatusCode = StatusCodes.Status500InternalServerError;
-            await context.Response.WriteAsJsonAsync(new { error = new { message = "Server misconfigured" } });
-            return;
-        }
-
-        // Skip validation for health endpoints
-        if (context.Request.Path == "/" || context.Request.Path == "/health")
-        {
-            await _next(context);
-            return;
+            logger.LogError("LEITIR_API_KEY not configured");
+            var errorResponse = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await errorResponse.WriteAsJsonAsync(new { error = new { message = "Server misconfigured" } }).ConfigureAwait(false);
+            return errorResponse;
         }
 
         // Check X-Api-Key header
-        var providedKey = context.Request.Headers["X-Api-Key"].FirstOrDefault();
+        var providedKey = req.Headers.TryGetValues("X-Api-Key", out var keys) ? keys.FirstOrDefault() : null;
 
         if (string.IsNullOrEmpty(providedKey) || providedKey != apiKey)
         {
-            _logger.LogWarning("Invalid API key provided");
-            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-            await context.Response.WriteAsJsonAsync(new { error = new { message = "Unauthorized" } });
-            return;
+            logger.LogWarning("Invalid API key provided");
+            var errorResponse = req.CreateResponse(HttpStatusCode.Unauthorized);
+            await errorResponse.WriteAsJsonAsync(new { error = new { message = "Unauthorized" } }).ConfigureAwait(false);
+            return errorResponse;
         }
 
-        await _next(context);
+        return null;
     }
 }

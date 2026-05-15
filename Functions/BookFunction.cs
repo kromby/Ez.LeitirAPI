@@ -4,6 +4,7 @@ using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 using Ez.Leitir.Services;
 using Ez.Leitir.Shaping;
+using Ez.Leitir.Middleware;
 
 namespace Ez.Leitir.Functions;
 
@@ -29,6 +30,13 @@ public class BookFunction
     {
         try
         {
+            // Validate API key
+            var validationError = await ApiKeyValidator.ValidateApiKey(req, _logger).ConfigureAwait(false);
+            if (validationError != null)
+            {
+                return validationError;
+            }
+
             // Get and trim mmsId from route param
             var trimmedMmsId = mmsId?.Trim();
 
