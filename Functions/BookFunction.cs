@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
@@ -9,8 +10,9 @@ using Ez.Leitir.Middleware;
 namespace Ez.Leitir.Functions;
 
 /// <summary>
-/// HTTP-triggered Azure Function for retrieving book details.
-/// GET /api/book/{mmsId}?lib=optional
+/// HTTP-triggered Azure Function for retrieving book details with public-library
+/// branch availability aggregated across all FRBR-related editions.
+/// GET /api/book/{mmsId}
 /// </summary>
 public class BookFunction
 {
@@ -30,17 +32,11 @@ public class BookFunction
     {
         try
         {
-            // Validate API key
             var validationError = await ApiKeyValidator.ValidateApiKey(req, _logger).ConfigureAwait(false);
             if (validationError != null)
-            {
                 return validationError;
-            }
 
-            // Get and trim mmsId from route param
             var trimmedMmsId = mmsId?.Trim();
-
-            // Validate required parameter
             if (string.IsNullOrEmpty(trimmedMmsId))
             {
                 var errorResponse = req.CreateResponse(HttpStatusCode.BadRequest);
@@ -48,25 +44,26 @@ public class BookFunction
                 return errorResponse;
             }
 
-            // Remove "alma" prefix if present
             if (trimmedMmsId.StartsWith("alma", StringComparison.OrdinalIgnoreCase))
-            {
                 trimmedMmsId = trimmedMmsId[4..];
-            }
 
-            // Parallel calls to both endpoints
-            var results = await Task.WhenAll(
-                _client.GetFullRecordAsync(trimmedMmsId),
-                _client.GetPhysicalServiceAsync(trimmedMmsId)
-            ).ConfigureAwait(false);
+            var institutionFilter = Environment.GetEnvironmentVariable("LEITIR_INSTITUTION_FILTER") ?? "354ILC_ALM";
 
-            var pnxDoc = results[0];
-            var physical = results[1];
+            // Step 1: consortium record — metadata + FRBR group id.
+            // The leitir consortium endpoint expects the id with the "alma" prefix.
+            var consortium = await _client.GetConsortiumRecordAsync($"alma{trimmedMmsId}").ConfigureAwait(false);
 
-            // Shape the response
-            var shaped = LeitirShaper.ShapeBook(pnxDoc, physical);
+            // Step 2: discover FRBR sibling editions (if any).
+            var siblings = await ResolveSiblingsAsync(consortium, trimmedMmsId).ConfigureAwait(false);
 
-            // Return success
+            // Step 3: fetch each edition's institution-scoped record in parallel.
+            // The /priv/nz/pnx/P/ endpoint expects the bare mmsId (no "alma" prefix).
+            var institutionTasks = siblings.Select(id => _client.GetInstitutionRecordAsync(id, institutionFilter));
+            var institutionRecords = await Task.WhenAll(institutionTasks).ConfigureAwait(false);
+
+            // Step 4: aggregate.
+            var shaped = LeitirShaper.ShapeBook(consortium, institutionRecords);
+
             var response = req.CreateResponse(HttpStatusCode.OK);
             await response.WriteAsJsonAsync(shaped).ConfigureAwait(false);
             return response;
@@ -79,6 +76,23 @@ public class BookFunction
         {
             return await HandleErrorResponse(req, ex, "book").ConfigureAwait(false);
         }
+    }
+
+    private async Task<string[]> ResolveSiblingsAsync(JsonElement consortium, string fallbackMmsId)
+    {
+        var frbrGroupId = LeitirShaper.ExtractFrbrGroupId(consortium);
+        if (string.IsNullOrEmpty(frbrGroupId))
+            return new[] { fallbackMmsId };
+
+        var editions = await _client.GetFrbrEditionsAsync(frbrGroupId).ConfigureAwait(false);
+        var siblings = LeitirShaper.ExtractMmsIds(editions);
+
+        if (siblings.Length == 0)
+            return new[] { fallbackMmsId };
+
+        // Always include the original mmsId — it may not appear in the FRBR facet result
+        // if it doesn't match the q=any,contains,a fallback term.
+        return siblings.Contains(fallbackMmsId) ? siblings : siblings.Append(fallbackMmsId).ToArray();
     }
 
     private async Task<HttpResponseData> HandleErrorResponse(HttpRequestData req, Exception ex, string context)

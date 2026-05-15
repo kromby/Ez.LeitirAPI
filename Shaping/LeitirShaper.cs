@@ -39,36 +39,38 @@ public static class LeitirShaper
     }
 
     /// <summary>
-    /// Transforms PNX search results into available and on-loan books.
+    /// Transforms PNX search results into available and on-loan books. A book is considered
+    /// available when the target institution (e.g., 354ILC_ALM) appears in its
+    /// delivery.almaInstitutionsList with status "available_in_institution". This is the
+    /// institution-level summary leitir.is itself surfaces on search results — branch-level
+    /// detail is only available on the book detail endpoint.
     /// </summary>
-    /// <param name="pnxs">JsonElement with docs array containing search results</param>
-    /// <param name="delivery">JsonElement with docs array containing delivery info (may be empty)</param>
-    /// <returns>SearchResponse with available[], onLoan[], total count, and optional didYouMean</returns>
-    public static SearchResponse ShapeSearch(JsonElement pnxs, JsonElement delivery)
+    /// <param name="pnxs">JsonElement with docs[] from /pub/pnxs</param>
+    /// <param name="delivery">Top-level array from /pub/delivery POST</param>
+    /// <param name="institutionFilter">Institution code (e.g. "354ILC_ALM") to surface in BranchesOnShelf</param>
+    public static SearchResponse ShapeSearch(JsonElement pnxs, JsonElement delivery, string institutionFilter)
     {
-        // Build delivery lookup map
+        // Index delivery records by mmsId. The response is a top-level array of records
+        // shaped like a doc (with pnx + delivery), not a {docs:[]} envelope.
         var deliveryByMms = new Dictionary<string, JsonElement>();
-        if (delivery.TryGetProperty("docs", out var deliveryDocs) && deliveryDocs.ValueKind == JsonValueKind.Array)
+        if (delivery.ValueKind == JsonValueKind.Array)
         {
-            foreach (var doc in deliveryDocs.EnumerateArray())
+            foreach (var doc in delivery.EnumerateArray())
             {
                 var id = FirstString(doc, "pnx/control/recordid");
                 if (id != null)
-                {
                     deliveryByMms[id] = doc;
-                }
             }
         }
 
         var available = new List<Book>();
         var onLoan = new List<Book>();
 
-        // Process each PNX document
         if (pnxs.TryGetProperty("docs", out var pnxDocs) && pnxDocs.ValueKind == JsonValueKind.Array)
         {
             foreach (var doc in pnxDocs.EnumerateArray())
             {
-                var book = PnxToBook(doc, deliveryByMms);
+                var book = PnxToBook(doc, deliveryByMms, institutionFilter);
                 if (book == null)
                     continue;
 
@@ -79,7 +81,6 @@ public static class LeitirShaper
             }
         }
 
-        // Get total count
         int total = available.Count + onLoan.Count;
         if (pnxs.TryGetProperty("info", out var info) && info.TryGetProperty("total", out var totalElement))
         {
@@ -87,7 +88,6 @@ public static class LeitirShaper
                 total = totalValue;
         }
 
-        // Get didYouMean if present
         string? didYouMean = null;
         if (pnxs.TryGetProperty("did_u_mean", out var didYouMeanElement) && didYouMeanElement.ValueKind == JsonValueKind.String)
         {
@@ -98,44 +98,19 @@ public static class LeitirShaper
     }
 
     /// <summary>
-    /// Transforms a detailed book record with physical availability information.
+    /// Builds a BookResponse from a consortium record (for metadata + FRBR id) and one or
+    /// more institution-scoped records (for branch holdings). Holdings are aggregated
+    /// across all editions and deduplicated by branch name, keeping the best status.
     /// </summary>
-    /// <param name="pnxDoc">JsonElement with full record (may be array or object)</param>
-    /// <param name="physical">JsonElement with availability info (may be array or object with records[])</param>
-    /// <returns>BookResponse with BookDetail and BranchAvailability[] array</returns>
-    public static BookResponse ShapeBook(JsonElement pnxDoc, JsonElement physical)
+    /// <param name="consortiumRecord">Response from /pub/pnxs/L/{mmsId} (array or object with pnx)</param>
+    /// <param name="institutionRecords">Per-edition responses from /priv/nz/pnx/P/{mmsId}?record-institution=...</param>
+    public static BookResponse ShapeBook(JsonElement consortiumRecord, JsonElement[] institutionRecords)
     {
-        // Extract pnx from either parameter, handling both object and array formats
-        JsonElement? pnxFromDoc = null;
-        if (pnxDoc.ValueKind == JsonValueKind.Array && pnxDoc.GetArrayLength() > 0)
-        {
-            var firstDoc = pnxDoc[0];
-            if (firstDoc.TryGetProperty("pnx", out var pnxElement))
-                pnxFromDoc = pnxElement;
-        }
-        else if (pnxDoc.TryGetProperty("pnx", out var pnxElement))
-        {
-            pnxFromDoc = pnxElement;
-        }
+        var pnx = ExtractPnx(consortiumRecord);
 
-        JsonElement? pnxFromPhysical = null;
-        if (physical.ValueKind == JsonValueKind.Array && physical.GetArrayLength() > 0)
-        {
-            var firstRecord = physical[0];
-            if (firstRecord.TryGetProperty("pnx", out var pnxElement))
-                pnxFromPhysical = pnxElement;
-        }
-        else if (physical.TryGetProperty("records", out var records) && records.ValueKind == JsonValueKind.Array && records.GetArrayLength() > 0)
-        {
-            var firstRecord = records[0];
-            if (firstRecord.TryGetProperty("pnx", out var pnxElement))
-                pnxFromPhysical = pnxElement;
-        }
-
-        var pnx = pnxFromDoc ?? pnxFromPhysical;
-
-        // Extract book details from pnx
         var mmsId = FirstString(pnx, "control/recordid") ?? "";
+        if (mmsId.StartsWith("alma", StringComparison.OrdinalIgnoreCase))
+            mmsId = mmsId[4..];
         var title = FirstString(pnx, "display/title") ?? "(óþekktur titill)";
         var author = FirstString(pnx, "display/creator") ?? FirstString(pnx, "display/contributor");
         var year = YearOf(FirstString(pnx, "display/creationdate"));
@@ -145,52 +120,158 @@ public static class LeitirShaper
         var pageCount = GetPageCount(FirstString(pnx, "display/format"));
         var coverSources = ToCoverSources(mmsId, isbn);
 
-        // Process branch availability
-        var branches = new List<BranchAvailability>();
-        var onShelfNames = new List<string>();
-        var returns = new List<string>();
+        // Aggregate holdings across all institution records, keyed by branch name.
+        // If the same branch appears in multiple editions, keep the entry with the best status.
+        var byBranch = new Dictionary<string, BranchAvailability>();
 
-        if (physical.TryGetProperty("records", out var physicalRecords) && physicalRecords.ValueKind == JsonValueKind.Array)
+        foreach (var record in institutionRecords)
         {
-            foreach (var record in physicalRecords.EnumerateArray())
+            foreach (var holding in EnumerateHoldings(record))
             {
-                var branch = GetBranchName(record);
-                var callNumber = GetCallNumber(record);
-                var isAvailable = IsAvailable(record);
+                var branch = GetHoldingBranch(holding);
+                if (string.IsNullOrEmpty(branch))
+                    continue;
 
-                if (isAvailable)
-                {
-                    branches.Add(new BranchAvailability(branch, "on-shelf", callNumber));
-                    onShelfNames.Add(branch);
-                }
-                else
-                {
-                    var dueDate = GetDueDate(record);
-                    branches.Add(new BranchAvailability(branch, "on-loan", callNumber, dueDate));
-                    if (dueDate != null)
-                        returns.Add(dueDate);
-                }
+                var callNumber = GetHoldingCallNumber(holding);
+                var status = MapHoldingStatus(GetHoldingAvailability(holding));
+                var entry = new BranchAvailability(branch, status, callNumber);
+
+                if (!byBranch.TryGetValue(branch, out var existing) || StatusPriority(status) > StatusPriority(existing.Status))
+                    byBranch[branch] = entry;
             }
         }
 
-        returns.Sort();
+        var branches = byBranch.Values
+            .OrderBy(b => b.Branch, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var onShelfNames = branches.Where(b => b.Status == "on-shelf").Select(b => b.Branch).ToArray();
 
         var book = new BookDetail(
             mmsId,
             title,
             coverSources,
-            onShelfNames.ToArray(),
+            onShelfNames,
             genres,
             author,
             year,
             isbn,
-            onShelfNames.Count == 0 && returns.Count > 0 ? returns[0] : null,
+            null,
             summary,
             pageCount
         );
 
-        return new BookResponse(book, branches.ToArray());
+        return new BookResponse(book, branches);
     }
+
+    /// <summary>
+    /// Extracts the FRBR group id from a consortium record so the caller can fetch
+    /// sibling editions. Returns null if absent.
+    /// </summary>
+    public static string? ExtractFrbrGroupId(JsonElement consortiumRecord)
+    {
+        var pnx = ExtractPnx(consortiumRecord);
+        return FirstString(pnx, "facets/frbrgroupid");
+    }
+
+    /// <summary>
+    /// Extracts Alma mmsIds from a pnxs search response. Non-Alma records (e.g., Primo
+    /// Central articles with ids like "cdi_crossref_...") are excluded — the delivery
+    /// endpoint 500s when sent non-Alma ids, and downstream endpoints don't handle them.
+    /// By default strips the "alma" prefix (the form expected by the institution-scoped
+    /// pnx/P/ endpoint). Pass withAlmaPrefix=true when calling /delivery, which keys
+    /// records by the full "alma..." id.
+    /// </summary>
+    public static string[] ExtractMmsIds(JsonElement pnxsResponse, bool withAlmaPrefix = false)
+    {
+        var ids = new List<string>();
+        if (pnxsResponse.TryGetProperty("docs", out var docs) && docs.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var doc in docs.EnumerateArray())
+            {
+                var id = FirstString(doc, "pnx/control/recordid");
+                if (id == null) continue;
+                if (!id.StartsWith("alma", StringComparison.OrdinalIgnoreCase)) continue;
+                ids.Add(withAlmaPrefix ? id : id[4..]);
+            }
+        }
+        return ids.ToArray();
+    }
+
+    private static JsonElement? ExtractPnx(JsonElement record)
+    {
+        if (record.ValueKind == JsonValueKind.Array && record.GetArrayLength() > 0)
+        {
+            var first = record[0];
+            if (first.TryGetProperty("pnx", out var pnxElement))
+                return pnxElement;
+        }
+        else if (record.ValueKind == JsonValueKind.Object && record.TryGetProperty("pnx", out var pnxElement))
+        {
+            return pnxElement;
+        }
+        return null;
+    }
+
+    private static IEnumerable<JsonElement> EnumerateHoldings(JsonElement institutionRecord)
+    {
+        JsonElement? delivery = null;
+        if (institutionRecord.ValueKind == JsonValueKind.Array && institutionRecord.GetArrayLength() > 0)
+        {
+            if (institutionRecord[0].TryGetProperty("delivery", out var d))
+                delivery = d;
+        }
+        else if (institutionRecord.ValueKind == JsonValueKind.Object && institutionRecord.TryGetProperty("delivery", out var d))
+        {
+            delivery = d;
+        }
+
+        if (delivery == null || !delivery.Value.TryGetProperty("holding", out var holding) || holding.ValueKind != JsonValueKind.Array)
+            yield break;
+
+        foreach (var entry in holding.EnumerateArray())
+        {
+            if (entry.ValueKind == JsonValueKind.Object)
+                yield return entry;
+        }
+    }
+
+    private static string GetHoldingBranch(JsonElement holding)
+    {
+        if (holding.TryGetProperty("mainLocation", out var ml) && ml.ValueKind == JsonValueKind.String)
+            return ml.GetString() ?? "";
+        if (holding.TryGetProperty("subLocation", out var sl) && sl.ValueKind == JsonValueKind.String)
+            return sl.GetString() ?? "";
+        return "";
+    }
+
+    private static string? GetHoldingCallNumber(JsonElement holding)
+    {
+        if (holding.TryGetProperty("callNumber", out var cn) && cn.ValueKind == JsonValueKind.String)
+            return cn.GetString();
+        return null;
+    }
+
+    private static string? GetHoldingAvailability(JsonElement holding)
+    {
+        if (holding.TryGetProperty("availabilityStatus", out var s) && s.ValueKind == JsonValueKind.String)
+            return s.GetString();
+        return null;
+    }
+
+    private static string MapHoldingStatus(string? primoStatus) => primoStatus switch
+    {
+        "available" => "on-shelf",
+        "unavailable" => "on-loan",
+        "check_holdings" => "on-loan",
+        _ => "unavailable",
+    };
+
+    private static int StatusPriority(string status) => status switch
+    {
+        "on-shelf" => 2,
+        "on-loan" => 1,
+        _ => 0,
+    };
 
     // ─── Private Helper Methods ──────────────────────────────────────────────
 
@@ -284,120 +365,6 @@ public static class LeitirShaper
     }
 
     /// <summary>
-    /// Extracts branch availability from a delivery record.
-    /// </summary>
-    /// <param name="deliveryDoc">JsonElement representing a delivery record</param>
-    /// <returns>Tuple of on-shelf branches and earliest return date</returns>
-    private static (string[] onShelf, string? earliestReturn) DeliveryToBranches(JsonElement? deliveryDoc)
-    {
-        var onShelf = new List<string>();
-        var returns = new List<string>();
-
-        if (deliveryDoc == null)
-            return ([], null);
-
-        if (!deliveryDoc.Value.TryGetProperty("delivery", out var delivery))
-            return ([], null);
-
-        if (!delivery.TryGetProperty("holding", out var holdings) || holdings.ValueKind != JsonValueKind.Array)
-            return ([], null);
-
-        var branchSet = new HashSet<string>();
-
-        foreach (var holding in holdings.EnumerateArray())
-        {
-            var branch = GetBranchFromHolding(holding);
-            if (string.IsNullOrEmpty(branch))
-                continue;
-
-            var isAvailable = holding.TryGetProperty("availabilityStatus", out var status) && status.GetString() == "available"
-                || holding.TryGetProperty("availability", out var avail) && avail.GetString() == "available";
-
-            if (isAvailable)
-            {
-                branchSet.Add(branch);
-            }
-            else if (holding.TryGetProperty("dueDate", out var dueDate) && dueDate.ValueKind == JsonValueKind.String)
-            {
-                returns.Add(dueDate.GetString() ?? "");
-            }
-        }
-
-        onShelf.AddRange(branchSet);
-        returns.Sort();
-
-        var earliestReturn = returns.Count > 0 ? returns[0] : null;
-        return (onShelf.ToArray(), earliestReturn);
-    }
-
-    /// <summary>
-    /// Extracts branch name from a holding record.
-    /// </summary>
-    private static string GetBranchFromHolding(JsonElement holding)
-    {
-        if (holding.TryGetProperty("libraryName", out var libraryName) && libraryName.ValueKind == JsonValueKind.String)
-            return libraryName.GetString() ?? "";
-
-        if (holding.TryGetProperty("subLocation", out var subLocation) && subLocation.ValueKind == JsonValueKind.String)
-            return subLocation.GetString() ?? "";
-
-        if (holding.TryGetProperty("location", out var location) && location.ValueKind == JsonValueKind.String)
-            return location.GetString() ?? "";
-
-        return "";
-    }
-
-    /// <summary>
-    /// Extracts branch name from a physical record.
-    /// </summary>
-    private static string GetBranchName(JsonElement record)
-    {
-        if (record.TryGetProperty("libraryName", out var libraryName) && libraryName.ValueKind == JsonValueKind.String)
-            return libraryName.GetString() ?? "(óþekkt útibú)";
-
-        if (record.TryGetProperty("location", out var location) && location.ValueKind == JsonValueKind.String)
-            return location.GetString() ?? "(óþekkt útibú)";
-
-        return "(óþekkt útibú)";
-    }
-
-    /// <summary>
-    /// Gets the call number from a physical record.
-    /// </summary>
-    private static string? GetCallNumber(JsonElement record)
-    {
-        if (record.TryGetProperty("callNumber", out var callNumber) && callNumber.ValueKind == JsonValueKind.String)
-            return callNumber.GetString();
-
-        return null;
-    }
-
-    /// <summary>
-    /// Determines if a physical record is available.
-    /// </summary>
-    private static bool IsAvailable(JsonElement record)
-    {
-        if (record.TryGetProperty("availabilityStatus", out var status) && status.ValueKind == JsonValueKind.String)
-            return status.GetString() == "available";
-
-        if (record.TryGetProperty("availability", out var avail) && avail.ValueKind == JsonValueKind.String)
-            return avail.GetString() == "available";
-
-        return false;
-    }
-
-    /// <summary>
-    /// Gets the due date from a physical record.
-    /// </summary>
-    private static string? GetDueDate(JsonElement record)
-    {
-        if (record.TryGetProperty("dueDate", out var dueDate) && dueDate.ValueKind == JsonValueKind.String)
-            return dueDate.GetString();
-
-        return null;
-    }
-
-    /// <summary>
     /// Extracts genres from pnx.display.subject array.
     /// </summary>
     private static string[] GetGenres(JsonElement? pnx)
@@ -438,7 +405,7 @@ public static class LeitirShaper
     /// <summary>
     /// Converts a PNX document to a Book record.
     /// </summary>
-    private static Book? PnxToBook(JsonElement doc, Dictionary<string, JsonElement> deliveryByMms)
+    private static Book? PnxToBook(JsonElement doc, Dictionary<string, JsonElement> deliveryByMms, string institutionFilter)
     {
         var mmsId = FirstString(doc, "pnx/control/recordid");
         if (mmsId == null)
@@ -449,25 +416,59 @@ public static class LeitirShaper
 
         var title = FirstString(doc, "pnx/display/title") ?? "(óþekktur titill)";
         var author = FirstString(doc, "pnx/display/creator") ?? FirstString(doc, "pnx/display/contributor");
-        var yearStr = FirstString(doc, "pnx/display/creationdate");
-        var year = YearOf(yearStr);
+        var year = YearOf(FirstString(doc, "pnx/display/creationdate"));
         var isbn = FirstString(doc, "pnx/search/isbn");
-        var coverSources = ToCoverSources(mmsId, isbn);
 
-        // Get delivery info for this book
-        var branches = deliveryByMms.TryGetValue(mmsId, out var delivery)
-            ? DeliveryToBranches(delivery)
-            : ([], null);
+        var almaStrippedId = mmsId.StartsWith("alma", StringComparison.OrdinalIgnoreCase) ? mmsId[4..] : mmsId;
+        var coverSources = ToCoverSources(almaStrippedId, isbn);
+
+        var onShelf = deliveryByMms.TryGetValue(mmsId, out var delivery)
+            ? InstitutionLabelIfAvailable(delivery, institutionFilter)
+            : Array.Empty<string>();
 
         return new Book(
-            mmsId,
+            almaStrippedId,
             title,
             author,
             year,
             isbn,
             coverSources,
-            branches.onShelf,
-            branches.onShelf.Length == 0 ? branches.earliestReturn : null
+            onShelf,
+            null
         );
+    }
+
+    /// <summary>
+    /// Returns the institution's display name in a single-entry array if the requested
+    /// institution has the book available; otherwise empty. Used to populate
+    /// Book.BranchesOnShelf at the search level without per-branch detail.
+    /// </summary>
+    private static string[] InstitutionLabelIfAvailable(JsonElement deliveryDoc, string institutionFilter)
+    {
+        if (!deliveryDoc.TryGetProperty("delivery", out var delivery))
+            return Array.Empty<string>();
+        if (!delivery.TryGetProperty("almaInstitutionsList", out var list) || list.ValueKind != JsonValueKind.Array)
+            return Array.Empty<string>();
+
+        foreach (var entry in list.EnumerateArray())
+        {
+            if (!entry.TryGetProperty("instCode", out var instCodeEl) || instCodeEl.ValueKind != JsonValueKind.String)
+                continue;
+            if (instCodeEl.GetString() != institutionFilter)
+                continue;
+
+            var status = entry.TryGetProperty("availabilityStatus", out var s) && s.ValueKind == JsonValueKind.String
+                ? s.GetString()
+                : null;
+            if (status != "available_in_institution")
+                return Array.Empty<string>();
+
+            var instName = entry.TryGetProperty("instName", out var n) && n.ValueKind == JsonValueKind.String
+                ? n.GetString()
+                : institutionFilter;
+            return new[] { instName ?? institutionFilter };
+        }
+
+        return Array.Empty<string>();
     }
 }

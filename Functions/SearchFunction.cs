@@ -57,14 +57,17 @@ public class SearchFunction
                 return errorResponse;
             }
 
-            // Call the client
             var pnxs = await _client.SearchAsync(q, scope, offset).ConfigureAwait(false);
 
-            // Create empty delivery
-            var emptyDelivery = JsonDocument.Parse("{\"docs\":[]}").RootElement;
+            // Look up institution-level availability for the result set. The delivery
+            // endpoint expects the mmsIds (with "alma" prefix) as a bare JSON array body.
+            var mmsIds = LeitirShaper.ExtractMmsIds(pnxs, withAlmaPrefix: true);
+            var delivery = mmsIds.Length > 0
+                ? await _client.DeliveryAsync(q, scope, offset, mmsIds).ConfigureAwait(false)
+                : JsonDocument.Parse("[]").RootElement;
 
-            // Shape the response
-            var shaped = LeitirShaper.ShapeSearch(pnxs, emptyDelivery);
+            var institutionFilter = Environment.GetEnvironmentVariable("LEITIR_INSTITUTION_FILTER") ?? "354ILC_ALM";
+            var shaped = LeitirShaper.ShapeSearch(pnxs, delivery, institutionFilter);
 
             // Return success
             var response = req.CreateResponse(HttpStatusCode.OK);

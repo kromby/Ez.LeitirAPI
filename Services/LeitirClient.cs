@@ -16,6 +16,7 @@ public class LeitirClient
     private readonly string _baseUrl;
     private readonly string _vid;
     private readonly string _inst;
+    private readonly string _defaultScope;
 
     public LeitirClient(HttpClient httpClient, LeitirJwtCache jwtCache, ILogger<LeitirClient> logger)
     {
@@ -25,7 +26,10 @@ public class LeitirClient
         _baseUrl = Environment.GetEnvironmentVariable("LEITIR_BASE_URL") ?? "https://www.leitir.is";
         _vid = Environment.GetEnvironmentVariable("LEITIR_VID") ?? "354ILC_NETWORK:10000_UNION";
         _inst = Environment.GetEnvironmentVariable("LEITIR_INST") ?? "354ILC_NETWORK";
+        _defaultScope = Environment.GetEnvironmentVariable("LEITIR_SCOPE") ?? "10000_MYLIB";
     }
+
+    public string DefaultScope => _defaultScope;
 
     /// <summary>
     /// Suggests search terms based on a query.
@@ -54,50 +58,62 @@ public class LeitirClient
     }
 
     /// <summary>
-    /// Gets delivery information for search results.
-    /// POST /primaws/rest/pub/delivery?q=any,contains,&inst=&scope=&vid=&lang=is&limit=20&offset=
+    /// Gets institution-level availability for a batch of records. The body is a bare
+    /// JSON array of mmsIds (with "alma" prefix) — Primo rejects {"mmsIds": [...]}.
+    /// Response is a top-level array; each entry's delivery.almaInstitutionsList[] lists
+    /// which institutions hold the record.
+    /// POST /primaws/rest/pub/delivery?q=any,contains,{q}&...&skipDelivery=Y
     /// </summary>
-    public async Task<JsonElement> DeliveryAsync(string q, string scope, int offset, CancellationToken cancellationToken = default)
+    public async Task<JsonElement> DeliveryAsync(string q, string scope, int offset, string[] mmsIds, CancellationToken cancellationToken = default)
     {
         var encodedQ = Uri.EscapeDataString($"any,contains,{q}");
         var encodedScope = Uri.EscapeDataString(scope);
-        var url = $"{_baseUrl}/primaws/rest/pub/delivery?q={encodedQ}&inst={Uri.EscapeDataString(_inst)}&scope={encodedScope}&vid={Uri.EscapeDataString(_vid)}&lang=is&limit=20&offset={offset}";
-        
-        return await AuthedJsonAsync(url, "POST", cancellationToken: cancellationToken).ConfigureAwait(false);
-    }
+        // qInclude= must be present (even empty) — Primo 500s without it on POST /delivery.
+        var url = $"{_baseUrl}/primaws/rest/pub/delivery?q={encodedQ}&inst={Uri.EscapeDataString(_inst)}&scope={encodedScope}&vid={Uri.EscapeDataString(_vid)}&tab=MyLibrary&limit=20&offset={offset}&sort=rank&lang=is&skipDelivery=Y&qInclude=&qExclude=";
 
-    /// <summary>
-    /// Gets delivery information for specific MMS IDs.
-    /// POST /primaws/rest/pub/delivery with { mmsIds } body
-    /// </summary>
-    public async Task<JsonElement> DeliveryByMmsIdsAsync(string[] mmsIds, string scope, CancellationToken cancellationToken = default)
-    {
-        var encodedScope = Uri.EscapeDataString(scope);
-        var url = $"{_baseUrl}/primaws/rest/pub/delivery?inst={Uri.EscapeDataString(_inst)}&scope={encodedScope}&vid={Uri.EscapeDataString(_vid)}&lang=is&limit=20&offset=0";
-        
-        var body = JsonSerializer.Serialize(new { mmsIds });
-        
+        var body = JsonSerializer.Serialize(mmsIds);
+
         return await AuthedJsonAsync(url, "POST", body, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Gets physical service information for a record.
-    /// GET /primaws/rest/pub/getPhysicalService/{mmsId}?vid=&recordOwner=&sourceRecordId=&resource_type=book
+    /// Gets the consortium-level record. Returns book metadata and the FRBR group id
+    /// (for editions lookup), but holdings are not populated at this level.
+    /// GET /primaws/rest/pub/pnxs/L/{mmsId}?vid=&lang=is&search_scope=&adaptor=Local Search Engine
     /// </summary>
-    public async Task<JsonElement> GetPhysicalServiceAsync(string mmsId, CancellationToken cancellationToken = default)
+    public async Task<JsonElement> GetConsortiumRecordAsync(string mmsId, CancellationToken cancellationToken = default)
     {
-        var url = $"{_baseUrl}/primaws/rest/pub/getPhysicalService/{Uri.EscapeDataString(mmsId)}?vid={Uri.EscapeDataString(_vid)}&recordOwner=&sourceRecordId=&resource_type=book";
-        
+        var url = $"{_baseUrl}/primaws/rest/pub/pnxs/L/{Uri.EscapeDataString(mmsId)}?vid={Uri.EscapeDataString(_vid)}&lang=is&search_scope={Uri.EscapeDataString(_defaultScope)}&adaptor={Uri.EscapeDataString("Local Search Engine")}";
+
         return await AuthedJsonAsync(url, "GET", cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Gets the full record for a specific MMS ID.
-    /// GET /primaws/rest/priv/nz/pnx/P/{mmsId}?record-institution=&lang=is
+    /// Lists all editions in the same FRBR group as a previously-resolved record.
+    /// Primo treats `qInclude` as the actual query filter (the URL-level `facet` is just
+    /// frontend state). The `q=any,contains,a` term is required by the API but ignored once
+    /// the FRBR filter is applied.
+    /// GET /primaws/rest/pub/pnxs?q=any,contains,a&qInclude=facet_frbrgroupid,exact,{frbrId}&...&skipDelivery=Y
     /// </summary>
-    public async Task<JsonElement> GetFullRecordAsync(string mmsId, CancellationToken cancellationToken = default)
+    public async Task<JsonElement> GetFrbrEditionsAsync(string frbrGroupId, CancellationToken cancellationToken = default)
     {
-        var url = $"{_baseUrl}/primaws/rest/priv/nz/pnx/P/{Uri.EscapeDataString(mmsId)}?record-institution={Uri.EscapeDataString(_inst)}&lang=is";
+        var encodedQ = Uri.EscapeDataString("any,contains,a");
+        var encodedQInclude = Uri.EscapeDataString($"facet_frbrgroupid,exact,{frbrGroupId}");
+        var encodedScope = Uri.EscapeDataString(_defaultScope);
+        var url = $"{_baseUrl}/primaws/rest/pub/pnxs?q={encodedQ}&qInclude={encodedQInclude}&inst={Uri.EscapeDataString(_inst)}&scope={encodedScope}&vid={Uri.EscapeDataString(_vid)}&tab=MyLibrary&limit=20&offset=0&sort=date_d&lang=is&skipDelivery=Y";
+
+        return await AuthedJsonAsync(url, "GET", cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gets the institution-scoped record for a specific MMS ID. The response contains
+    /// delivery.holding[] with per-branch availability, but only when the institution
+    /// actually has the edition. Otherwise holding is empty/null.
+    /// GET /primaws/rest/priv/nz/pnx/P/{mmsId}?record-institution={institutionCode}&lang=is
+    /// </summary>
+    public async Task<JsonElement> GetInstitutionRecordAsync(string mmsId, string institutionCode, CancellationToken cancellationToken = default)
+    {
+        var url = $"{_baseUrl}/primaws/rest/priv/nz/pnx/P/{Uri.EscapeDataString(mmsId)}?record-institution={Uri.EscapeDataString(institutionCode)}&lang=is";
 
         return await AuthedJsonAsync(url, "GET", cancellationToken: cancellationToken).ConfigureAwait(false);
     }
