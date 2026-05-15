@@ -1,3 +1,5 @@
+using System.Text.Json;
+using Azure.Core.Serialization;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Extensions.DependencyInjection;
@@ -20,6 +22,11 @@ builder.Services
     .AddHttpClient()
     .AddSingleton<LeitirJwtCache>()
     .AddScoped<LeitirClient>();
+
+builder.Services.Configure<WorkerOptions>(options =>
+{
+    options.Serializer = new JsonObjectSerializer(new JsonSerializerOptions(JsonSerializerDefaults.Web));
+});
 
 // CORS configuration
 var allowedOrigins = Environment.GetEnvironmentVariable("ALLOWED_ORIGINS") ?? "";
