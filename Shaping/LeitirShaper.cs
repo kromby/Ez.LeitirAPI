@@ -106,19 +106,22 @@ public static class LeitirShaper
     /// <param name="institutionRecords">Per-edition responses from /priv/nz/pnx/P/{mmsId}?record-institution=...</param>
     public static BookResponse ShapeBook(JsonElement consortiumRecord, JsonElement[] institutionRecords)
     {
+        var consortiumDoc = ExtractDoc(consortiumRecord);
         var pnx = ExtractPnx(consortiumRecord);
 
         var mmsId = FirstString(pnx, "control/recordid") ?? "";
         if (mmsId.StartsWith("alma", StringComparison.OrdinalIgnoreCase))
             mmsId = mmsId[4..];
         var title = FirstString(pnx, "display/title") ?? "(óþekktur titill)";
-        var author = FirstString(pnx, "display/creator") ?? FirstString(pnx, "display/contributor");
+        var author = FirstString(pnx, "addata/au")
+            ?? FirstString(pnx, "display/creator")
+            ?? FirstString(pnx, "display/contributor");
         var year = YearOf(FirstString(pnx, "display/creationdate"));
         var isbn = FirstString(pnx, "search/isbn");
         var summary = FirstString(pnx, "display/description");
         var genres = GetGenres(pnx);
         var pageCount = GetPageCount(FirstString(pnx, "display/format"));
-        var coverSources = ToCoverSources(mmsId, isbn);
+        var coverSources = ToCoverSources(consortiumDoc, mmsId, isbn);
 
         // Aggregate holdings across all institution records, keyed by branch name.
         // If the same branch appears in multiple editions, keep the entry with the best status.
@@ -209,6 +212,15 @@ public static class LeitirShaper
         {
             return pnxElement;
         }
+        return null;
+    }
+
+    private static JsonElement? ExtractDoc(JsonElement record)
+    {
+        if (record.ValueKind == JsonValueKind.Array && record.GetArrayLength() > 0)
+            return record[0];
+        if (record.ValueKind == JsonValueKind.Object)
+            return record;
         return null;
     }
 
@@ -330,27 +342,82 @@ public static class LeitirShaper
     }
 
     /// <summary>
-    /// Builds an array of cover source URLs for a book.
+    /// Builds an array of cover source URLs for a book. URLs Primo advertises in
+    /// <c>doc.delivery.link[]</c> (where <c>linkType == "thumbnail"</c>) come first — these
+    /// are the URLs leitir.is itself renders, e.g. <c>https://thumbs.leitir.is/{isbn}.jpg</c>.
+    /// JSONP endpoints (Google Books bibkeys callback) are skipped because they don't load
+    /// as &lt;img&gt; sources. baekur.is + Syndetics are appended as fallbacks for older
+    /// records where Primo doesn't advertise a working thumbnail.
     /// </summary>
-    /// <param name="mmsId">MMS identifier for the book</param>
-    /// <param name="isbn">Optional ISBN for secondary cover source</param>
-    /// <returns>Array of cover source URLs</returns>
-    private static string[] ToCoverSources(string mmsId, string? isbn)
+    /// <param name="doc">The top-level doc JsonElement (contains delivery + pnx siblings), or null</param>
+    /// <param name="mmsId">MMS identifier for the book (alma-prefix stripped)</param>
+    /// <param name="isbn">Optional ISBN for the Syndetics fallback</param>
+    private static string[] ToCoverSources(JsonElement? doc, string mmsId, string? isbn)
     {
-        var sources = new List<string>
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var sources = new List<string>();
+
+        foreach (var url in ExtractThumbnailUrlsFromDoc(doc))
         {
-            $"https://baekur.is/cover/tbn/{mmsId}"
-        };
+            if (seen.Add(url))
+                sources.Add(url);
+        }
+
+        var baekurUrl = $"https://baekur.is/cover/tbn/{mmsId}";
+        if (seen.Add(baekurUrl))
+            sources.Add(baekurUrl);
 
         if (!string.IsNullOrEmpty(isbn))
         {
             var encodedIsbn = Uri.EscapeDataString(isbn);
-            sources.Add(
-                $"https://proxy-euf.hosted.exlibrisgroup.com/exl_rewrite/syndetics.com/index.php?client=primo&isbn={encodedIsbn}/sc.jpg"
-            );
+            var syndeticsUrl =
+                $"https://proxy-euf.hosted.exlibrisgroup.com/exl_rewrite/syndetics.com/index.php?client=primo&isbn={encodedIsbn}/sc.jpg";
+            if (seen.Add(syndeticsUrl))
+                sources.Add(syndeticsUrl);
         }
 
         return sources.ToArray();
+    }
+
+    /// <summary>
+    /// Extracts thumbnail URLs from a Primo doc's <c>delivery.link[]</c> array, in the order
+    /// Primo returns them. JSONP endpoints (contain <c>callback=</c> or <c>jscmd=</c>) are
+    /// skipped — they don't load as &lt;img&gt; sources and would just cause failed image
+    /// requests in the consuming UI.
+    /// </summary>
+    private static IEnumerable<string> ExtractThumbnailUrlsFromDoc(JsonElement? doc)
+    {
+        if (doc is null || doc.Value.ValueKind != JsonValueKind.Object)
+            yield break;
+        if (!doc.Value.TryGetProperty("delivery", out var delivery) || delivery.ValueKind != JsonValueKind.Object)
+            yield break;
+        if (!delivery.TryGetProperty("link", out var links) || links.ValueKind != JsonValueKind.Array)
+            yield break;
+
+        foreach (var link in links.EnumerateArray())
+        {
+            if (link.ValueKind != JsonValueKind.Object)
+                continue;
+
+            var linkType = link.TryGetProperty("linkType", out var lt) && lt.ValueKind == JsonValueKind.String
+                ? lt.GetString()
+                : null;
+            if (!string.Equals(linkType, "thumbnail", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var url = link.TryGetProperty("linkURL", out var lu) && lu.ValueKind == JsonValueKind.String
+                ? lu.GetString()
+                : null;
+            if (string.IsNullOrEmpty(url))
+                continue;
+
+            // Skip JSONP endpoints — Google Books bibkeys callback returns JS, not an image.
+            if (url.Contains("callback=", StringComparison.OrdinalIgnoreCase) ||
+                url.Contains("jscmd=", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            yield return url;
+        }
     }
 
     /// <summary>
@@ -415,12 +482,14 @@ public static class LeitirShaper
             return null;
 
         var title = FirstString(doc, "pnx/display/title") ?? "(óþekktur titill)";
-        var author = FirstString(doc, "pnx/display/creator") ?? FirstString(doc, "pnx/display/contributor");
+        var author = FirstString(doc, "pnx/addata/au")
+            ?? FirstString(doc, "pnx/display/creator")
+            ?? FirstString(doc, "pnx/display/contributor");
         var year = YearOf(FirstString(doc, "pnx/display/creationdate"));
         var isbn = FirstString(doc, "pnx/search/isbn");
 
         var almaStrippedId = mmsId.StartsWith("alma", StringComparison.OrdinalIgnoreCase) ? mmsId[4..] : mmsId;
-        var coverSources = ToCoverSources(almaStrippedId, isbn);
+        var coverSources = ToCoverSources(doc, almaStrippedId, isbn);
 
         var onShelf = deliveryByMms.TryGetValue(mmsId, out var delivery)
             ? InstitutionLabelIfAvailable(delivery, institutionFilter)

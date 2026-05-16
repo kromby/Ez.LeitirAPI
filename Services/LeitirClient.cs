@@ -153,7 +153,7 @@ public class LeitirClient
 
         var jsonElement = JsonDocument.Parse(responseContent).RootElement;
         var dataSnippet = responseContent.Length > 300 ? responseContent[..300] : responseContent;
-        
+
         _logger.LogInformation(
             "HTTP request succeeded: {Method} {Url} returned {StatusCode}. Data: {DataSnippet}",
             method,

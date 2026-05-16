@@ -1,4 +1,6 @@
+# @baseUrl = ez-func-leitirapi-bzbdgwg3h3gncefe.westeurope-01.azurewebsites.net
 @baseUrl = http://localhost:7071
+
 @apiKey = test-key-change-me
 
 ###
@@ -17,7 +19,7 @@ X-Api-Key: {{apiKey}}
 
 ###
 # Search by keyword → 200 with results
-GET {{baseUrl}}/api/search?q=laxness&scope=10000_MYLIB&offset=0
+GET {{baseUrl}}/api/search?q=kennarinn sem&scope=10000_MYLIB&offset=0
 X-Api-Key: {{apiKey}}
 
 ###
@@ -27,5 +29,5 @@ X-Api-Key: {{apiKey}}
 
 ###
 # Book detail → 200 with branches
-GET {{baseUrl}}/api/book/991009684239706886
+GET {{baseUrl}}/api/book/991016596577206886
 X-Api-Key: {{apiKey}}
