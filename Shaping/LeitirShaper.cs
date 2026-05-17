@@ -421,17 +421,6 @@ public static class LeitirShaper
     }
 
     /// <summary>
-    /// Determines if a document represents a physical book.
-    /// </summary>
-    /// <param name="doc">JsonElement to check</param>
-    /// <returns>True if document is a book, journal, newspaper, or manuscript</returns>
-    private static bool IsPhysicalBook(JsonElement? doc)
-    {
-        var type = FirstString(doc, "pnx/display/type")?.ToLowerInvariant() ?? "";
-        return new[] { "book", "journal", "newspaper", "manuscript" }.Contains(type);
-    }
-
-    /// <summary>
     /// Extracts genres from pnx.display.subject array.
     /// </summary>
     private static string[] GetGenres(JsonElement? pnx)
@@ -476,9 +465,6 @@ public static class LeitirShaper
     {
         var mmsId = FirstString(doc, "pnx/control/recordid");
         if (mmsId == null)
-            return null;
-
-        if (!IsPhysicalBook(doc))
             return null;
 
         var title = FirstString(doc, "pnx/display/title") ?? "(óþekktur titill)";
