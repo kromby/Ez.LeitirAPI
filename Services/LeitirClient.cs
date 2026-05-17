@@ -45,15 +45,19 @@ public class LeitirClient
     }
 
     /// <summary>
-    /// Searches for records in the library.
-    /// GET /primaws/rest/pub/pnxs?q=any,contains,&inst=&scope=&vid=&tab=MyLibrary&limit=20&offset=&sort=rank&lang=is
+    /// Searches for records in the library. Restricted to physical books via
+    /// `qInclude=facet_rtype,exact,books` — without this, Primo's rank-sort floods the
+    /// top of the result set with articles/videos that match the query string in metadata,
+    /// pushing actual books past offset=20 even when hundreds of book matches exist.
+    /// GET /primaws/rest/pub/pnxs?q=any,contains,&qInclude=facet_rtype,exact,books&inst=&scope=&vid=&tab=MyLibrary&limit=20&offset=&sort=rank&lang=is
     /// </summary>
     public async Task<JsonElement> SearchAsync(string q, string scope, int offset, CancellationToken cancellationToken = default)
     {
         var encodedQ = Uri.EscapeDataString($"any,contains,{q}");
+        var encodedQInclude = Uri.EscapeDataString("facet_rtype,exact,books");
         var encodedScope = Uri.EscapeDataString(scope);
-        var url = $"{_baseUrl}/primaws/rest/pub/pnxs?q={encodedQ}&inst={Uri.EscapeDataString(_inst)}&scope={encodedScope}&vid={Uri.EscapeDataString(_vid)}&tab=MyLibrary&limit=20&offset={offset}&sort=rank&lang=is";
-        
+        var url = $"{_baseUrl}/primaws/rest/pub/pnxs?q={encodedQ}&qInclude={encodedQInclude}&inst={Uri.EscapeDataString(_inst)}&scope={encodedScope}&vid={Uri.EscapeDataString(_vid)}&tab=MyLibrary&limit=20&offset={offset}&sort=rank&lang=is";
+
         return await AuthedJsonAsync(url, "GET", cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
